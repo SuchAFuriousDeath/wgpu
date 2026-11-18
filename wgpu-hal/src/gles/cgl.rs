@@ -87,7 +87,6 @@ mod ffi {
     pub type SetVirtualScreen = unsafe extern "C" fn(ctx: CGLContextObj, screen: c_int) -> CGLError;
     pub type GetVirtualScreen =
         unsafe extern "C" fn(ctx: CGLContextObj, screen: *mut c_int) -> CGLError;
-    pub type FlushDrawable = unsafe extern "C" fn(ctx: CGLContextObj) -> CGLError;
     pub type LockContext = unsafe extern "C" fn(ctx: CGLContextObj) -> CGLError;
     pub type ErrorString = unsafe extern "C" fn(error: CGLError) -> *const c_char;
 
@@ -129,7 +128,6 @@ struct Cgl {
     set_parameter: ffi::SetParameter,
     set_virtual_screen: ffi::SetVirtualScreen,
     get_virtual_screen: ffi::GetVirtualScreen,
-    flush_drawable: ffi::FlushDrawable,
     lock_context: ffi::LockContext,
     unlock_context: ffi::LockContext,
     error_string: ffi::ErrorString,
@@ -173,7 +171,6 @@ impl Cgl {
             set_parameter: sym(&library, c"CGLSetParameter")?,
             set_virtual_screen: sym(&library, c"CGLSetVirtualScreen")?,
             get_virtual_screen: sym(&library, c"CGLGetVirtualScreen")?,
-            flush_drawable: sym(&library, c"CGLFlushDrawable")?,
             lock_context: sym(&library, c"CGLLockContext")?,
             unlock_context: sym(&library, c"CGLUnlockContext")?,
             error_string: sym(&library, c"CGLErrorString")?,
@@ -783,8 +780,9 @@ fn new_ns_opengl_context(
 /// The AppKit side of a [`Surface`], together with the surface's CGL context.
 ///
 /// The `NSOpenGLContext` and the view are messaged on the main thread, through
-/// [`run_on_main`], except for reading the view's window and its screen (see
-/// [`Self::check_screen`]). Other threads otherwise only retain and release this, and the
+/// [`run_on_main`], except for reading the view's window and its state (see
+/// [`Self::check_window`]) and for `flushBuffer`, which AppKit allows on any thread as long as
+/// the CGL context is locked. Other threads otherwise only retain and release this, and the
 /// surface hands its own reference to the main thread when it's dropped, so the last
 /// reference, and with it the view's, is released there too.
 struct ViewState {
@@ -803,7 +801,7 @@ struct ViewState {
     drawable_size: Mutex<Option<(u32, u32)>>,
     /// The virtual screen of `context`, as last seen by [`Self::refresh`], or -1.
     virtual_screen: AtomicI32,
-    /// The `NSScreen` that the view's window was on when [`Self::check_screen`] last ran.
+    /// The `NSScreen` that the view's window was on when [`Self::check_window`] last ran.
     screen: Mutex<Option<Retained<AnyObject>>>,
 }
 
@@ -826,18 +824,32 @@ impl ViewState {
         });
     }
 
-    /// Queues a [`Self::refresh`] after the view's window moved to another display, which can
-    /// mean another GPU.
+    /// Returns whether any part of the view's window is visible, and queues a
+    /// [`Self::refresh`] after the window moved to another display, which can mean another
+    /// GPU.
     ///
-    /// AppKit expects an `update` of the context then, normally in response to
+    /// AppKit expects an `update` of the context after such a move, normally in response to
     /// `NSViewGlobalFrameDidChangeNotification`, which nothing observes here, and winit reports
     /// a window that only moved as `Moved`, not `Resized`, so applications don't reconfigure
-    /// the surface either. Reads the window's screen from the calling thread, much like the
-    /// Metal backend reads the window's occlusion state.
-    fn check_screen(self: &Arc<Self>) {
-        let screen: Option<Retained<AnyObject>> = autoreleasepool(|_| unsafe {
+    /// the surface either.
+    ///
+    /// Reads the window's state from the calling thread, like the Metal backend does.
+    fn check_window(self: &Arc<Self>) -> bool {
+        const NS_WINDOW_OCCLUSION_STATE_VISIBLE: usize = 1 << 1;
+
+        let (screen, visible) = autoreleasepool(|_| unsafe {
             let window: Option<Retained<AnyObject>> = msg_send![&*self.view, window];
-            window.and_then(|window| msg_send![&*window, screen])
+            match window {
+                Some(window) => {
+                    let screen: Option<Retained<AnyObject>> = msg_send![&*window, screen];
+                    let occlusion_state: usize = msg_send![&*window, occlusionState];
+                    (
+                        screen,
+                        occlusion_state & NS_WINDOW_OCCLUSION_STATE_VISIBLE != 0,
+                    )
+                }
+                None => (None, false),
+            }
         });
         let mut last_screen = self.screen.lock();
         let changed =
@@ -847,6 +859,23 @@ impl ViewState {
             drop(last_screen);
             self.queue_refresh();
         }
+        visible
+    }
+
+    /// Presents what was blitted into the drawable.
+    ///
+    /// Uses `-[NSOpenGLContext flushBuffer]` rather than `CGLFlushDrawable`, since AppKit
+    /// presents layer-backed views through its own path. Every view is layer-backed in
+    /// applications built against the macOS 10.14 SDK or later.
+    fn flush_buffer(&self) -> Result<(), String> {
+        let cgl = &self.context.cgl;
+        let _cgl_lock = self.context.lock();
+        let previous = unsafe { (cgl.get_current_context)() };
+        self.context.make_current()?;
+        autoreleasepool(|_| unsafe {
+            let _: () = msg_send![&*self.ns_context, flushBuffer];
+        });
+        cgl.check(unsafe { (cgl.set_current_context)(previous) })
     }
 
     /// Attaches the context to the view, or updates its drawable after the view's size,
@@ -1005,7 +1034,6 @@ impl Surface {
             .as_ref()
             .ok_or(crate::SurfaceError::Other("surface isn't configured"))?;
         let gl = context.lock();
-        let cgl = &self.state.context.cgl;
 
         let virtual_screen = self.state.virtual_screen.load(Ordering::Acquire);
         if virtual_screen >= 0 {
@@ -1073,17 +1101,17 @@ impl Surface {
             };
             unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
 
-            Ok(cgl.check(unsafe { (cgl.flush_drawable)(self.state.context.raw) }))
+            Ok(())
         });
+        // Flushing may block until the next display refresh with vsync. Don't hold the adapter
+        // context lock meanwhile: other threads waiting for it give up after a second.
+        drop(gl);
 
         match result {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(e))) => {
+            Ok(Ok(())) => self.state.flush_buffer().map_err(|e| {
                 log::error!("unable to flush the surface drawable: {e}");
-                Err(crate::SurfaceError::Other(
-                    "unable to flush the surface drawable",
-                ))
-            }
+                crate::SurfaceError::Other("unable to flush the surface drawable")
+            }),
             Ok(Err((draw_status, _))) if draw_status != glow::FRAMEBUFFER_COMPLETE => {
                 // The view lost its drawable, or never got one. Have the next acquisition
                 // attach to it again.
@@ -1227,7 +1255,12 @@ impl crate::Surface for Surface {
                 return Err(crate::SurfaceError::Occluded);
             }
         }
-        self.state.check_screen();
+        // Neither render nor present while the window is hidden. Besides saving the work,
+        // AppKit doesn't honour the swap interval for occluded windows, so presenting would
+        // spin as fast as it can instead of waiting for vsync.
+        if !self.state.check_window() {
+            return Err(crate::SurfaceError::Occluded);
+        }
 
         let texture = super::Texture {
             inner: super::TextureInner::Renderbuffer {
