@@ -1079,9 +1079,13 @@ impl Surface {
                 return Err((draw_status, read_status));
             }
 
-            // `GL_FRAMEBUFFER_SRGB` is never enabled on the surface context, so the blit copies
-            // the bytes without any sRGB conversion.
-            //
+            // Disable sRGB conversions for the blit, like the WGL backend does, so that it copies
+            // the bytes of sRGB swapchain formats as they are. The surface context never enables
+            // `GL_FRAMEBUFFER_SRGB`, but say so explicitly. Caveat, shared with WGL: before GL
+            // 4.4, the spec didn't tie decoding an sRGB read buffer to `GL_FRAMEBUFFER_SRGB`, so
+            // a driver may still decode it here and present sRGB formats too dark.
+            unsafe { gl.disable(glow::FRAMEBUFFER_SRGB) };
+
             // Note the Y-flipping here. GL's presentation is not flipped,
             // but main rendering is. Therefore, we Y-flip the output positions
             // in the shader, and also this blit.
@@ -1135,7 +1139,8 @@ impl Surface {
     }
 
     pub fn supports_srgb(&self) -> bool {
-        // `GL_FRAMEBUFFER_SRGB` is core in every context this backend creates.
+        // `GL_FRAMEBUFFER_SRGB` is core in every context this backend creates. See `present`
+        // for a caveat about presenting sRGB formats.
         true
     }
 }
