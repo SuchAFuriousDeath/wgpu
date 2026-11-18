@@ -1001,16 +1001,38 @@ impl crate::Device for super::Device {
                     }
                 };
             } else if desc.sample_count > 1 {
-                unsafe {
-                    gl.tex_storage_2d_multisample(
-                        target,
-                        desc.sample_count as i32,
-                        format_desc.internal,
-                        desc.size.width as i32,
-                        desc.size.height as i32,
-                        true,
-                    )
-                };
+                // `glTexStorage2DMultisample` needs desktop GL 4.3 (or
+                // `ARB_texture_storage_multisample`). Older desktop GL, like the 4.1 that macOS
+                // caps out at, only has the mutable variant from GL 3.2.
+                let version = gl.version();
+                let has_storage_multisample = version.is_embedded
+                    || (version.major, version.minor) >= (4, 3)
+                    || gl
+                        .supported_extensions()
+                        .contains("GL_ARB_texture_storage_multisample");
+                if has_storage_multisample {
+                    unsafe {
+                        gl.tex_storage_2d_multisample(
+                            target,
+                            desc.sample_count as i32,
+                            format_desc.internal,
+                            desc.size.width as i32,
+                            desc.size.height as i32,
+                            true,
+                        )
+                    };
+                } else {
+                    unsafe {
+                        gl.tex_image_2d_multisample(
+                            target,
+                            desc.sample_count as i32,
+                            format_desc.internal as i32,
+                            desc.size.width as i32,
+                            desc.size.height as i32,
+                            true,
+                        )
+                    };
+                }
             } else {
                 unsafe {
                     if self
