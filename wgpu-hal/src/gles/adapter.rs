@@ -731,6 +731,13 @@ impl super::Adapter {
             super::PrivateCapabilities::TEXTURE_FORMAT_NORM16_STORAGE,
             supports_16bit_norm_storage,
         );
+        private_caps.set(
+            super::PrivateCapabilities::TEXTURE_STORAGE_MULTISAMPLE,
+            // GLES has no mutable variant to fall back to, so always use this one there.
+            es_ver.is_some()
+                || supported((3, 1), (4, 3))
+                || extensions.contains("GL_ARB_texture_storage_multisample"),
+        );
 
         // GLSL ES 3.10+ / GLSL 4.30+ natively support coherent/volatile qualifiers
         // on storage buffers. These were introduced alongside storage buffer support.

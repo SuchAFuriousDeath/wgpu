@@ -256,6 +256,11 @@ bitflags::bitflags! {
         /// `GL_ARB_shader_image_load_store`; GLES needs `GL_NV_image_formats`
         /// (which itself depends on `GL_EXT_texture_norm16`).
         const TEXTURE_FORMAT_NORM16_STORAGE = 1 << 20;
+        /// Use `glTexStorage2DMultisample` (GLES 3.1+, GL 4.3+ or
+        /// `GL_ARB_texture_storage_multisample`) for multisampled textures. Older desktop GL,
+        /// like the 4.1 that macOS caps out at, only has the mutable `glTexImage2DMultisample`
+        /// (GL 3.2). Always set on GLES, which has no mutable variant.
+        const TEXTURE_STORAGE_MULTISAMPLE = 1 << 21;
     }
 }
 
