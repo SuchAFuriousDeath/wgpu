@@ -52,6 +52,7 @@ mod ffi {
     pub const kCGLPFADoubleBuffer: CGLPixelFormatAttribute = 5;
     pub const kCGLPFAColorSize: CGLPixelFormatAttribute = 8;
     pub const kCGLPFAAlphaSize: CGLPixelFormatAttribute = 11;
+    pub const kCGLPFANoRecovery: CGLPixelFormatAttribute = 72;
     pub const kCGLPFAAccelerated: CGLPixelFormatAttribute = 73;
     pub const kCGLPFAAllowOfflineRenderers: CGLPixelFormatAttribute = 96;
     pub const kCGLPFAOpenGLProfile: CGLPixelFormatAttribute = 99;
@@ -216,7 +217,8 @@ impl PixelFormat {
         let mut last_error = String::from("no pixel format matched");
 
         // Prefer a hardware renderer, but fall back to Apple's software renderer rather
-        // than failing outright.
+        // than failing outright. The software renderer is then chosen explicitly, and shows up
+        // as a CPU adapter.
         for accelerated in [true, false] {
             for profile in profiles {
                 let mut attributes = Vec::with_capacity(12);
@@ -228,7 +230,10 @@ impl PixelFormat {
                 // switching in its `Info.plist`.
                 attributes.push(ffi::kCGLPFAAllowOfflineRenderers);
                 if accelerated {
-                    attributes.push(ffi::kCGLPFAAccelerated);
+                    // Without `NoRecovery`, CGL may silently move a hardware context to the
+                    // software renderer, e.g. when the GPU runs out of memory, and keep
+                    // reporting the hardware adapter's capabilities meanwhile.
+                    attributes.extend([ffi::kCGLPFAAccelerated, ffi::kCGLPFANoRecovery]);
                 }
                 attributes.push(0);
 
