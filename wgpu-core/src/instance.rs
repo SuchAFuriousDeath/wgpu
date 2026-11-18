@@ -86,8 +86,10 @@ impl Instance {
         this.try_add_hal(hal::api::Metal, &instance_desc, telemetry);
         #[cfg(dx12)]
         this.try_add_hal(hal::api::Dx12, &instance_desc, telemetry);
-        #[cfg(gles)]
+        #[cfg(all(gles, not(all(target_os = "macos", feature = "cgl", metal))))]
         this.try_add_hal(hal::api::Gles, &instance_desc, telemetry);
+        #[cfg(all(gles, target_os = "macos", feature = "cgl", metal))]
+        this.try_add_cgl_or_metal(&instance_desc, telemetry);
         #[cfg(feature = "noop")]
         this.try_add_hal(hal::api::Noop, &instance_desc, telemetry);
 
@@ -141,6 +143,59 @@ impl Instance {
                     A::VARIANT,
                     err
                 );
+            }
+        }
+    }
+
+    /// Helper for `Instance::new()`; adds the GL backend on macOS with native OpenGL (CGL), and
+    /// keeps only one of it and Metal.
+    ///
+    /// CGL is meant for Macs whose GPUs don't support Metal, and the two backends can't share
+    /// an instance well:
+    /// - Creating a surface creates one for every backend of the instance. Metal's makes the
+    ///   view layer-backed and adds a `CAMetalLayer` to it, which interferes with presenting
+    ///   OpenGL to the same view.
+    /// - Initializing CGL creates an OpenGL context, which on Macs with automatic graphics
+    ///   switching may power up the discrete GPU, even if the application then uses Metal.
+    ///
+    /// So when both are requested, GL is only initialized if Metal doesn't expose any adapter,
+    /// and Metal is dropped from the instance if GL then initializes. Applications that want
+    /// GL on Macs that support Metal need an instance with only [`Backends::GL`].
+    #[cfg(all(gles, target_os = "macos", feature = "cgl", metal))]
+    fn try_add_cgl_or_metal(
+        &mut self,
+        instance_desc: &wgt::InstanceDescriptor,
+        telemetry: Option<hal::Telemetry>,
+    ) {
+        let metal = self
+            .instance_per_backend
+            .iter()
+            .position(|(backend, _)| *backend == Backend::Metal);
+
+        if let Some(metal) = metal {
+            if instance_desc.backends.contains(Backends::GL) {
+                let (_, instance) = &self.instance_per_backend[metal];
+                if !unsafe { instance.enumerate_adapters(None) }.is_empty() {
+                    log::debug!(
+                        "Instance::new: not creating the {:?} backend, as Metal is available",
+                        Backend::Gl
+                    );
+                    self.supported_backends |= Backends::GL;
+                    return;
+                }
+            }
+        }
+
+        let instance_count = self.instance_per_backend.len();
+        self.try_add_hal(hal::api::Gles, instance_desc, telemetry);
+        if let Some(metal) = metal {
+            if self.instance_per_backend.len() > instance_count {
+                log::debug!(
+                    "Instance::new: dropping the Metal backend, which has no adapters, in favor \
+                     of {:?}",
+                    Backend::Gl
+                );
+                self.instance_per_backend.remove(metal);
             }
         }
     }

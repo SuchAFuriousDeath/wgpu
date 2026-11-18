@@ -942,6 +942,15 @@ impl ViewState {
             if current_view == view && self.attached.load(Ordering::Acquire) {
                 let _: () = msg_send![&*self.ns_context, update];
             } else {
+                if has_metal_layer(&self.view) {
+                    log::warn!(
+                        "The surface's view has a CAMetalLayer, likely from a Metal surface \
+                         created for the same window. It may hide what OpenGL presents, or \
+                         keep it from presenting at all. Create OpenGL surfaces from an \
+                         instance with only the GL backend."
+                    );
+                }
+
                 // Either never attached, or presenting found no drawable although a view is
                 // set: attach from scratch.
                 if !current_view.is_null() {
@@ -986,6 +995,37 @@ impl ViewState {
             let _: () = msg_send![&*self.ns_context, clearDrawable];
         });
     }
+}
+
+/// Returns whether `view`'s layer, or one of its sublayers, is a `CAMetalLayer`, as created by
+/// Metal surfaces (see `raw_window_metal::Layer::from_ns_view`).
+///
+/// # Safety
+///
+/// Must be called on the main thread, with an `NSView`.
+unsafe fn has_metal_layer(view: &AnyObject) -> bool {
+    let Some(metal_layer_class) = AnyClass::get(c"CAMetalLayer") else {
+        return false;
+    };
+    let layer: *mut AnyObject = unsafe { msg_send![view, layer] };
+    if layer.is_null() {
+        return false;
+    }
+    let is_metal_layer = |layer: *mut AnyObject| -> bool {
+        unsafe { msg_send![layer, isKindOfClass: metal_layer_class] }
+    };
+    if is_metal_layer(layer) {
+        return true;
+    }
+    let sublayers: *mut AnyObject = unsafe { msg_send![layer, sublayers] };
+    if sublayers.is_null() {
+        return false;
+    }
+    let count: usize = unsafe { msg_send![sublayers, count] };
+    (0..count).any(|i| {
+        let sublayer: *mut AnyObject = unsafe { msg_send![sublayers, objectAtIndex: i] };
+        is_metal_layer(sublayer)
+    })
 }
 
 #[repr(C)]

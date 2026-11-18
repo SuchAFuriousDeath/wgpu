@@ -145,7 +145,8 @@ gles = [
 webgl = ["wgpu-core-deps-wasm/webgl", "wgpu-types/web"]
 ## OpenGL backend, on macOS only
 angle = ["wgpu-core-deps-apple/angle"]
-## Native OpenGL backend through CGL, on macOS only
+## Native OpenGL backend through CGL, on macOS only. Doesn't share an instance with Metal:
+## see `Instance::new`.
 cgl = ["wgpu-core-deps-apple/cgl"]
 ## Vulkan portability backend, only available on macOS
 vulkan-portability = ["wgpu-core-deps-apple/vulkan-portability"]

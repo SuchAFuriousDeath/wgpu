@@ -81,7 +81,13 @@ webgpu = [
 angle = ["wgpu-core?/angle"]
 
 ## Enables the GLES backend on macOS through native OpenGL (CGL), for Macs without Metal
-## support. Takes precedence over `angle` when both are enabled.
+## support. Takes precedence over `angle` when both are enabled. Needs OpenGL 3.3, i.e. macOS
+## 10.9 or later.
+##
+## Metal and CGL don't share an instance: when both are requested, the GL backend is only
+## initialized if Metal has no adapter, and replaces Metal then. To use OpenGL on a Mac that
+## supports Metal, create an instance with only `Backends::GL`, and create OpenGL surfaces
+## from it, not from an instance with Metal.
 cgl = ["wgpu-core?/cgl"]
 
 ## Enables the Vulkan backend on macOS & iOS only for use with [MoltenVK](https://github.com/KhronosGroup/MoltenVK).
