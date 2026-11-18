@@ -16,12 +16,13 @@ use core::{
     mem::ManuallyDrop,
     panic::AssertUnwindSafe,
     ptr,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
 use glow::HasContext;
 use objc2::{
-    encode::{Encoding, RefEncode},
+    encode::{Encode, Encoding, RefEncode},
     msg_send,
     rc::{autoreleasepool, Allocated, Retained},
     runtime::{AnyClass, AnyObject},
@@ -588,10 +589,12 @@ impl crate::Instance for Instance {
             ns_context,
             view,
             context,
+            attached: AtomicBool::new(false),
+            refresh_queued: AtomicBool::new(false),
+            drawable_size: Mutex::new(None),
         });
 
-        let main_state = Arc::clone(&state);
-        run_on_main(move |mtm| main_state.attach(mtm));
+        state.queue_refresh();
 
         Ok(Surface {
             state: ManuallyDrop::new(state),
@@ -743,6 +746,13 @@ struct ViewState {
     /// can't outlive it.
     view: Retained<AnyObject>,
     context: CglContext,
+    /// Whether the context has a drawable on `view`: set by [`Self::refresh`], and cleared
+    /// when presenting finds no drawable.
+    attached: AtomicBool,
+    /// Whether a [`Self::refresh`] is queued on the main thread and didn't start yet.
+    refresh_queued: AtomicBool,
+    /// The size of the drawable in pixels, as last seen by [`Self::refresh`].
+    drawable_size: Mutex<Option<(u32, u32)>>,
 }
 
 // SAFETY: See the type's documentation.
@@ -750,26 +760,70 @@ unsafe impl Send for ViewState {}
 unsafe impl Sync for ViewState {}
 
 impl ViewState {
-    fn attach(&self, _mtm: MainThreadMarker) {
-        let _cgl_lock = self.context.lock();
-        autoreleasepool(|_| unsafe {
-            let _: () = msg_send![&*self.ns_context, setView: &*self.view];
+    /// Runs [`Self::refresh`] on the main thread, unless one is queued already.
+    ///
+    /// Right away on the main thread, otherwise asynchronously: see [`run_on_main`].
+    fn queue_refresh(self: &Arc<Self>) {
+        if self.refresh_queued.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let state = Arc::clone(self);
+        run_on_main(move |mtm| {
+            state.refresh_queued.store(false, Ordering::Release);
+            state.refresh(mtm);
         });
     }
 
-    /// Updates the drawable after the view's size or position changed.
-    ///
-    /// AppKit refuses to attach a context to a view that isn't on screen yet ("invalid
-    /// drawable"), so this also retries attaching the view if the context has none.
-    fn update(&self, _mtm: MainThreadMarker) {
+    /// Attaches the context to the view, or updates its drawable after the view's size or
+    /// position changed.
+    fn refresh(&self, _mtm: MainThreadMarker) {
         let _cgl_lock = self.context.lock();
-        autoreleasepool(|_| unsafe {
+        let attached = autoreleasepool(|_| unsafe {
+            // AppKit refuses to attach a context to a view whose window has no window device
+            // yet, i.e. was never on screen ("invalid drawable"). Don't try before then.
+            let window: *mut AnyObject = msg_send![&*self.view, window];
+            if window.is_null() {
+                return false;
+            }
+            let window_number: isize = msg_send![window, windowNumber];
+            if window_number <= 0 {
+                return false;
+            }
+
             let current_view: *mut AnyObject = msg_send![&*self.ns_context, view];
-            if current_view.is_null() {
+            let view = Retained::as_ptr(&self.view).cast_mut();
+            if current_view == view && self.attached.load(Ordering::Acquire) {
+                let _: () = msg_send![&*self.ns_context, update];
+            } else {
+                // Either never attached, or presenting found no drawable although a view is
+                // set: attach from scratch.
+                if !current_view.is_null() {
+                    let _: () = msg_send![&*self.ns_context, clearDrawable];
+                }
+                // Render at the display's resolution on Retina displays, so that the drawable
+                // matches the view's backing size, as wgpu expects from surfaces. winit does
+                // this too, but other windowing libraries may not.
+                let _: () = msg_send![&*self.view, setWantsBestResolutionOpenGLSurface: true];
                 let _: () = msg_send![&*self.ns_context, setView: &*self.view];
             }
-            let _: () = msg_send![&*self.ns_context, update];
+
+            let current_view: *mut AnyObject = msg_send![&*self.ns_context, view];
+            if current_view != view {
+                return false;
+            }
+
+            let bounds: CGRect = msg_send![&*self.view, bounds];
+            let backing: CGRect = msg_send![&*self.view, convertRectToBacking: bounds];
+            *self.drawable_size.lock() = Some((
+                backing.size.width.round() as u32,
+                backing.size.height.round() as u32,
+            ));
+            true
         });
+        if !attached {
+            log::debug!("the surface's view isn't on screen yet, will retry attaching to it");
+        }
+        self.attached.store(attached, Ordering::Release);
     }
 
     fn detach(&self, _mtm: MainThreadMarker) {
@@ -778,6 +832,40 @@ impl ViewState {
             let _: () = msg_send![&*self.ns_context, clearDrawable];
         });
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGSize {
+    width: f64,
+    height: f64,
+}
+
+/// `NSRect` on 64-bit macOS.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGRect {
+    origin: CGPoint,
+    size: CGSize,
+}
+
+unsafe impl Encode for CGPoint {
+    const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+}
+
+unsafe impl Encode for CGSize {
+    const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+}
+
+unsafe impl Encode for CGRect {
+    const ENCODING: Encoding = Encoding::Struct("CGRect", &[CGPoint::ENCODING, CGSize::ENCODING]);
 }
 
 #[derive(Debug)]
@@ -837,6 +925,21 @@ impl Surface {
         let gl = context.lock();
         let cgl = &self.state.context.cgl;
 
+        // The drawable can lag behind the configured size while the view is being resized,
+        // and differs from it if the application configured the surface with another size
+        // than the view's. Stretch to it then, like `CAMetalLayer` does.
+        let (width, height) = (sc.extent.width as i32, sc.extent.height as i32);
+        let (dst_width, dst_height) = self
+            .state
+            .drawable_size
+            .lock()
+            .map_or((width, height), |(w, h)| (w as i32, h as i32));
+        let filter = if (dst_width, dst_height) == (width, height) {
+            glow::NEAREST
+        } else {
+            glow::LINEAR
+        };
+
         let result = gl.with_surface_context(&self.state.context, |gl| {
             unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(sc.framebuffer)) };
             // Reattach every frame: a context only reliably observes changes another context of
@@ -851,6 +954,16 @@ impl Surface {
             };
             unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None) };
 
+            // Without a drawable, the default framebuffer is `GL_FRAMEBUFFER_UNDEFINED`.
+            let draw_status = unsafe { gl.check_framebuffer_status(glow::DRAW_FRAMEBUFFER) };
+            let read_status = unsafe { gl.check_framebuffer_status(glow::READ_FRAMEBUFFER) };
+            if draw_status != glow::FRAMEBUFFER_COMPLETE
+                || read_status != glow::FRAMEBUFFER_COMPLETE
+            {
+                unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
+                return Err((draw_status, read_status));
+            }
+
             // `GL_FRAMEBUFFER_SRGB` is never enabled on the surface context, so the blit copies
             // the bytes without any sRGB conversion.
             //
@@ -860,28 +973,41 @@ impl Surface {
             unsafe {
                 gl.blit_framebuffer(
                     0,
-                    sc.extent.height as i32,
-                    sc.extent.width as i32,
+                    height,
+                    width,
                     0,
                     0,
                     0,
-                    sc.extent.width as i32,
-                    sc.extent.height as i32,
+                    dst_width,
+                    dst_height,
                     glow::COLOR_BUFFER_BIT,
-                    glow::NEAREST,
+                    filter,
                 )
             };
             unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
 
-            cgl.check(unsafe { (cgl.flush_drawable)(self.state.context.raw) })
+            Ok(cgl.check(unsafe { (cgl.flush_drawable)(self.state.context.raw) }))
         });
 
         match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(e))) => {
                 log::error!("unable to flush the surface drawable: {e}");
                 Err(crate::SurfaceError::Other(
                     "unable to flush the surface drawable",
+                ))
+            }
+            Ok(Err((draw_status, _))) if draw_status != glow::FRAMEBUFFER_COMPLETE => {
+                // The view lost its drawable, or never got one. Have the next acquisition
+                // attach to it again.
+                log::debug!("the surface has no drawable (status {draw_status:#x}), skipping");
+                self.state.attached.store(false, Ordering::Release);
+                Err(crate::SurfaceError::Occluded)
+            }
+            Ok(Err((_, read_status))) => {
+                log::error!("the swapchain framebuffer is incomplete (status {read_status:#x})");
+                Err(crate::SurfaceError::Other(
+                    "the swapchain framebuffer is incomplete",
                 ))
             }
             Err(e) => {
@@ -934,8 +1060,7 @@ impl crate::Surface for Surface {
         }
 
         // Pick up a resized view before the next present.
-        let state = Arc::clone(&self.state);
-        run_on_main(move |mtm| state.update(mtm));
+        self.state.queue_refresh();
 
         let format_desc = device.shared.describe_texture_format(config.format);
         let gl = &device.shared.context.lock();
@@ -1005,6 +1130,17 @@ impl crate::Surface for Surface {
         let sc = swapchain
             .as_ref()
             .ok_or(crate::SurfaceError::Other("surface isn't configured"))?;
+
+        // Attaching fails while the view isn't on screen, e.g. while an application configures
+        // the surface of a window it shows only afterwards. Retry until it succeeds, without
+        // rendering frames that couldn't be presented.
+        if !self.state.attached.load(Ordering::Acquire) {
+            self.state.queue_refresh();
+            if !self.state.attached.load(Ordering::Acquire) {
+                return Err(crate::SurfaceError::Occluded);
+            }
+        }
+
         let texture = super::Texture {
             inner: super::TextureInner::Renderbuffer {
                 raw: sc.renderbuffer,
