@@ -16,7 +16,7 @@ use core::{
     mem::ManuallyDrop,
     panic::AssertUnwindSafe,
     ptr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, Ordering},
     time::Duration,
 };
 
@@ -84,6 +84,9 @@ mod ffi {
         pname: CGLContextParameter,
         params: *const c_int,
     ) -> CGLError;
+    pub type SetVirtualScreen = unsafe extern "C" fn(ctx: CGLContextObj, screen: c_int) -> CGLError;
+    pub type GetVirtualScreen =
+        unsafe extern "C" fn(ctx: CGLContextObj, screen: *mut c_int) -> CGLError;
     pub type FlushDrawable = unsafe extern "C" fn(ctx: CGLContextObj) -> CGLError;
     pub type LockContext = unsafe extern "C" fn(ctx: CGLContextObj) -> CGLError;
     pub type ErrorString = unsafe extern "C" fn(error: CGLError) -> *const c_char;
@@ -124,6 +127,8 @@ struct Cgl {
     set_current_context: ffi::SetCurrentContext,
     get_current_context: ffi::GetCurrentContext,
     set_parameter: ffi::SetParameter,
+    set_virtual_screen: ffi::SetVirtualScreen,
+    get_virtual_screen: ffi::GetVirtualScreen,
     flush_drawable: ffi::FlushDrawable,
     lock_context: ffi::LockContext,
     unlock_context: ffi::LockContext,
@@ -166,6 +171,8 @@ impl Cgl {
             set_current_context: sym(&library, c"CGLSetCurrentContext")?,
             get_current_context: sym(&library, c"CGLGetCurrentContext")?,
             set_parameter: sym(&library, c"CGLSetParameter")?,
+            set_virtual_screen: sym(&library, c"CGLSetVirtualScreen")?,
+            get_virtual_screen: sym(&library, c"CGLGetVirtualScreen")?,
             flush_drawable: sym(&library, c"CGLFlushDrawable")?,
             lock_context: sym(&library, c"CGLLockContext")?,
             unlock_context: sym(&library, c"CGLUnlockContext")?,
@@ -296,6 +303,13 @@ impl CglContext {
         }
         self.cgl
             .check(unsafe { (self.cgl.set_current_context)(ptr::null_mut()) })
+    }
+
+    fn virtual_screen(&self) -> Result<c_int, String> {
+        let mut screen = 0;
+        self.cgl
+            .check(unsafe { (self.cgl.get_virtual_screen)(self.raw, &mut screen) })?;
+        Ok(screen)
     }
 
     /// Takes the CGL lock of this context. It serializes access between threads that use the
@@ -431,6 +445,37 @@ impl AdapterContextLock<'_> {
         let result = f(&self.inner.gl);
         cgl.check(unsafe { (cgl.set_current_context)(previous) })?;
         Ok(result)
+    }
+
+    /// Moves the adapter context to `virtual_screen`, i.e. to the renderer (GPU) that a surface
+    /// context presents with after its window moved to another display.
+    ///
+    /// Apple asks to keep contexts that share objects with an on-screen context on the same
+    /// virtual screen as it, so that the driver doesn't need to shuttle every shared object
+    /// between GPUs. Chromium does the same for its offscreen contexts. Unverified on real
+    /// multi-GPU hardware: the adapter's limits and features stay those of the renderer it was
+    /// created on, which may differ from the new renderer's.
+    fn follow_virtual_screen(&self, virtual_screen: c_int) {
+        let Some(context) = &self.inner.context else {
+            return;
+        };
+        match context.virtual_screen() {
+            Ok(current) if current == virtual_screen => {}
+            Ok(current) => {
+                log::info!(
+                    "Moving the CGL adapter context from virtual screen {current} to \
+                     {virtual_screen}"
+                );
+                unsafe { self.inner.gl.flush() };
+                let cgl = &context.cgl;
+                if let Err(e) =
+                    cgl.check(unsafe { (cgl.set_virtual_screen)(context.raw, virtual_screen) })
+                {
+                    log::warn!("unable to set the virtual screen of the adapter context: {e}");
+                }
+            }
+            Err(e) => log::warn!("unable to get the virtual screen of the adapter context: {e}"),
+        }
     }
 }
 
@@ -592,6 +637,8 @@ impl crate::Instance for Instance {
             attached: AtomicBool::new(false),
             refresh_queued: AtomicBool::new(false),
             drawable_size: Mutex::new(None),
+            virtual_screen: AtomicI32::new(-1),
+            screen: Mutex::new(None),
         });
 
         state.queue_refresh();
@@ -735,10 +782,11 @@ fn new_ns_opengl_context(
 
 /// The AppKit side of a [`Surface`], together with the surface's CGL context.
 ///
-/// The `NSOpenGLContext` and the view are only messaged on the main thread, through
-/// [`run_on_main`]. Other threads only retain and release this, and the surface hands its
-/// own reference to the main thread when it's dropped, so the last reference, and with it
-/// the view's, is released there too.
+/// The `NSOpenGLContext` and the view are messaged on the main thread, through
+/// [`run_on_main`], except for reading the view's window and its screen (see
+/// [`Self::check_screen`]). Other threads otherwise only retain and release this, and the
+/// surface hands its own reference to the main thread when it's dropped, so the last
+/// reference, and with it the view's, is released there too.
 struct ViewState {
     /// Declared before `context`, so that it gives up its reference to the CGL context first.
     ns_context: Retained<AnyObject>,
@@ -753,6 +801,10 @@ struct ViewState {
     refresh_queued: AtomicBool,
     /// The size of the drawable in pixels, as last seen by [`Self::refresh`].
     drawable_size: Mutex<Option<(u32, u32)>>,
+    /// The virtual screen of `context`, as last seen by [`Self::refresh`], or -1.
+    virtual_screen: AtomicI32,
+    /// The `NSScreen` that the view's window was on when [`Self::check_screen`] last ran.
+    screen: Mutex<Option<Retained<AnyObject>>>,
 }
 
 // SAFETY: See the type's documentation.
@@ -774,8 +826,31 @@ impl ViewState {
         });
     }
 
-    /// Attaches the context to the view, or updates its drawable after the view's size or
-    /// position changed.
+    /// Queues a [`Self::refresh`] after the view's window moved to another display, which can
+    /// mean another GPU.
+    ///
+    /// AppKit expects an `update` of the context then, normally in response to
+    /// `NSViewGlobalFrameDidChangeNotification`, which nothing observes here, and winit reports
+    /// a window that only moved as `Moved`, not `Resized`, so applications don't reconfigure
+    /// the surface either. Reads the window's screen from the calling thread, much like the
+    /// Metal backend reads the window's occlusion state.
+    fn check_screen(self: &Arc<Self>) {
+        let screen: Option<Retained<AnyObject>> = autoreleasepool(|_| unsafe {
+            let window: Option<Retained<AnyObject>> = msg_send![&*self.view, window];
+            window.and_then(|window| msg_send![&*window, screen])
+        });
+        let mut last_screen = self.screen.lock();
+        let changed =
+            last_screen.as_ref().map(Retained::as_ptr) != screen.as_ref().map(Retained::as_ptr);
+        if changed {
+            *last_screen = screen;
+            drop(last_screen);
+            self.queue_refresh();
+        }
+    }
+
+    /// Attaches the context to the view, or updates its drawable after the view's size,
+    /// position or display changed.
     fn refresh(&self, _mtm: MainThreadMarker) {
         let _cgl_lock = self.context.lock();
         let attached = autoreleasepool(|_| unsafe {
@@ -810,6 +885,13 @@ impl ViewState {
             let current_view: *mut AnyObject = msg_send![&*self.ns_context, view];
             if current_view != view {
                 return false;
+            }
+
+            match self.context.virtual_screen() {
+                Ok(screen) => self.virtual_screen.store(screen, Ordering::Release),
+                Err(e) => {
+                    log::warn!("unable to get the virtual screen of the surface context: {e}")
+                }
             }
 
             let bounds: CGRect = msg_send![&*self.view, bounds];
@@ -924,6 +1006,11 @@ impl Surface {
             .ok_or(crate::SurfaceError::Other("surface isn't configured"))?;
         let gl = context.lock();
         let cgl = &self.state.context.cgl;
+
+        let virtual_screen = self.state.virtual_screen.load(Ordering::Acquire);
+        if virtual_screen >= 0 {
+            gl.follow_virtual_screen(virtual_screen);
+        }
 
         // The drawable can lag behind the configured size while the view is being resized,
         // and differs from it if the application configured the surface with another size
@@ -1140,6 +1227,7 @@ impl crate::Surface for Surface {
                 return Err(crate::SurfaceError::Occluded);
             }
         }
+        self.state.check_screen();
 
         let texture = super::Texture {
             inner: super::TextureInner::Renderbuffer {
