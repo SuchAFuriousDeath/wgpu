@@ -528,9 +528,14 @@ impl super::Adapter {
                 || extensions.contains("OES_geometry_shader")
                 || extensions.contains("GL_ARB_geometry_shader4"),
         );
+        // Forcing early tests needs `early_fragment_tests` (GL 4.2 or
+        // `ARB_shader_image_load_store`), and allowing them needs depth layout qualifiers
+        // (GL 4.2 or `ARB_conservative_depth`), as naga emits one or the other.
         features.set(
             wgt::Features::SHADER_EARLY_DEPTH_TEST,
-            supported((3, 1), (4, 2)) || extensions.contains("GL_ARB_shader_image_load_store"),
+            supported((3, 1), (4, 2))
+                || (extensions.contains("GL_ARB_shader_image_load_store")
+                    && extensions.contains("GL_ARB_conservative_depth")),
         );
         if extensions.contains("GL_ARB_timer_query") {
             features.set(wgt::Features::TIMESTAMP_QUERY, true);

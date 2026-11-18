@@ -8,6 +8,20 @@
 //!
 //! Everything is loaded at runtime from `OpenGL.framework`, so an application built with
 //! this backend still starts on systems where OpenGL is unavailable.
+//!
+//! # Shader limitations
+//!
+//! macOS caps out at OpenGL 4.1 and exposes few extensions beyond it. Most gaps show up as
+//! missing features, limits and downlevel flags, but two WGSL builtins have nothing in wgpu
+//! that reports them, so shaders using them pass validation and only fail when the pipeline
+//! is created, with a GLSL compile error about an unsupported extension:
+//!
+//! - `textureNumLevels` needs GL 4.3 or `GL_ARB_texture_query_levels`.
+//! - `textureNumSamples` needs `GL_ARB_shader_texture_image_samples`, which naga requests even
+//!   where it is core (GL 4.5).
+//!
+//! wgpu-hal's own image bounds checks, which would need the former, are disabled before
+//! GL 4.3 already.
 
 use alloc::{boxed::Box, ffi::CString, format, string::String, sync::Arc, vec::Vec};
 use core::{
