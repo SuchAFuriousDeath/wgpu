@@ -141,7 +141,12 @@ impl super::Adapter {
             "v3d",
             "apple m", // all apple m are integrated
         ];
-        let strings_that_imply_cpu = ["mesa offscreen", "swiftshader", "llvmpipe"];
+        let strings_that_imply_cpu = [
+            "mesa offscreen",
+            "swiftshader",
+            "llvmpipe",
+            "apple software renderer",
+        ];
 
         //TODO: handle Intel Iris XE as discreet
         let inferred_device_type = if vendor.contains("qualcomm")
@@ -1368,7 +1373,7 @@ impl crate::Adapter for super::Adapter {
 
             Some(crate::SurfaceCapabilities {
                 formats,
-                present_modes: if cfg!(windows) {
+                present_modes: if cfg!(any(windows, cgl)) {
                     vec![wgt::PresentMode::Fifo, wgt::PresentMode::Immediate]
                 } else {
                     vec![wgt::PresentMode::Fifo] //TODO

@@ -19,6 +19,7 @@ rust-version = "1.76"
 [features]
 metal = ["wgpu-hal/metal"]
 angle = ["wgpu-hal/gles", "wgpu-hal/renderdoc"]
+cgl = ["wgpu-hal/cgl"]
 vulkan-portability = ["wgpu-hal/vulkan", "wgpu-hal/renderdoc"]
 
 # Depend on wgpu-hal conditionally, so that the above features only apply to wgpu-hal on this set of platforms.

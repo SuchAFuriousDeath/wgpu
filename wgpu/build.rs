@@ -31,7 +31,9 @@ fn main() {
             all(any(windows, target_os = "linux", target_os = "android", target_os = "freebsd", Emscripten), feature = "gles"),
             // On Apple platforms, however, we require the `angle` feature to explicitly opt-in to OpenGL
             // since its meant to be used with ANGLE.
-            all(target_vendor = "apple", feature = "angle")
+            all(target_vendor = "apple", feature = "angle"),
+            // Native OpenGL through CGL on macOS, for Macs without Metal support.
+            all(target_os = "macos", feature = "cgl")
         ) },
         noop: { feature = "noop" },
 
