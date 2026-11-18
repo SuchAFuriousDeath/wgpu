@@ -134,8 +134,8 @@ gles = [
     "windows/Win32_System_LibraryLoader",
     "windows/Win32_UI_WindowsAndMessaging",
 ]
-## Enables the GLES backend on macOS through native OpenGL (CGL) instead of EGL/ANGLE.
-## Implies `gles`. Has no effect on other platforms.
+## Makes the GLES backend use native OpenGL through CGL on macOS, instead of EGL (ANGLE).
+## Implies `gles`, so it enables the regular GLES backend on all other platforms.
 cgl = ["gles"]
 ## Enables the DX12 backend when targeting Windows.
 dx12 = [

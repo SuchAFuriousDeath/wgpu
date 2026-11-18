@@ -1,7 +1,7 @@
 //! Native desktop OpenGL on macOS through CGL.
 //!
-//! The adapter owns a headless CGL context (OpenGL 4.1 or 3.2+ core profile) that all GL
-//! work happens on. Every [`Surface`] owns a second CGL context in the same share group,
+//! The adapter owns a headless CGL context (an OpenGL 4.1 core profile, or 3.3 on GPUs without
+//! 4.1 support) that all GL work happens on. Every [`Surface`] owns a second CGL context in the same share group,
 //! attached to the window's `NSView` through an `NSOpenGLContext`. Swapchain images are
 //! renderbuffers in the share group; presenting blits the renderbuffer into the surface
 //! context's default framebuffer and flushes it, like the WGL backend does with the window DC.
@@ -20,8 +20,8 @@
 //! - `textureNumSamples` needs `GL_ARB_shader_texture_image_samples`, which naga requests even
 //!   where it is core (GL 4.5).
 //!
-//! wgpu-hal's own image bounds checks, which would need the former, are disabled before
-//! GL 4.3 already.
+//! wgpu-hal's own image bounds checks, which would need these too, are disabled before GL 4.3
+//! already.
 
 use alloc::{boxed::Box, ffi::CString, format, string::String, sync::Arc, vec::Vec};
 use core::{
@@ -71,7 +71,7 @@ mod ffi {
     pub const kCGLPFAAllowOfflineRenderers: CGLPixelFormatAttribute = 96;
     pub const kCGLPFAOpenGLProfile: CGLPixelFormatAttribute = 99;
 
-    /// macOS 10.7+.
+    /// macOS 10.7+. Also known as `kCGLOGLPVersion_GL3_Core`.
     pub const kCGLOGLPVersion_3_2_Core: CGLPixelFormatAttribute = 0x3200;
     /// macOS 10.9+. Older systems reject it with `kCGLBadAttribute`.
     pub const kCGLOGLPVersion_GL4_Core: CGLPixelFormatAttribute = 0x4100;
@@ -227,6 +227,11 @@ struct PixelFormat {
 
 impl PixelFormat {
     fn choose(cgl: &Arc<Cgl>) -> Result<Self, crate::InstanceError> {
+        // wgpu needs OpenGL 3.3 (see `Adapter::expose`), which no profile asks for directly.
+        // The 3.2 profile is a fallback for GPUs that can't do 4.1, like the Intel HD 3000 and
+        // NVIDIA GeForce 9400M and 320M: it gives the newest core version the renderer
+        // supports, which is 3.3 for those since macOS 10.9. On older systems it's 3.2, and the
+        // adapter is rejected later.
         let profiles = [ffi::kCGLOGLPVersion_GL4_Core, ffi::kCGLOGLPVersion_3_2_Core];
         let mut last_error = String::from("no pixel format matched");
 
@@ -785,9 +790,21 @@ fn new_ns_opengl_context(
     })?;
 
     // `CglContext` keeps its own reference to the CGL context. Apple doesn't document
-    // whether `NSOpenGLContext` retains the context it wraps, so if it didn't, give it a
-    // reference of its own. Should it then never release that reference, the context
-    // leaks, which beats the over-release we'd risk otherwise.
+    // whether `-[NSOpenGLContext initWithCGLContextObj:]` retains the context it wraps, or
+    // whether the `NSOpenGLContext` releases it when deallocated, so look at the retain count
+    // (`CGLGetContextRetainCount` is public API) instead of assuming either way:
+    //
+    // - If it went up, the `NSOpenGLContext` holds a reference of its own, which it'll
+    //   presumably release when deallocated.
+    // - If it didn't, give the `NSOpenGLContext` a reference to adopt. Should it release one
+    //   when deallocated, that's balanced. Should it never do so, the context leaks, which
+    //   beats the use after free we'd risk by not retaining it.
+    //
+    // The count is read outside of the autorelease pool the `NSOpenGLContext` is created in,
+    // so that temporary references autoreleased during its creation don't count. Deriving the
+    // CGL context from an `NSOpenGLContext` created through `initWithFormat:shareContext:`
+    // instead would make the ownership documented, but would need the adapter's context to be
+    // an `NSOpenGLContext` too, and with it AppKit to be loaded even without any window.
     let new_retain_count = unsafe { (cgl.get_context_retain_count)(context.raw) };
     if new_retain_count <= retain_count {
         log::debug!(
