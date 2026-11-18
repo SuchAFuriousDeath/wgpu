@@ -9,11 +9,12 @@
 //! Everything is loaded at runtime from `OpenGL.framework`, so an application built with
 //! this backend still starts on systems where OpenGL is unavailable.
 
-use alloc::{ffi::CString, format, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, ffi::CString, format, string::String, sync::Arc, vec::Vec};
 use core::{
     ffi::{c_int, c_void, CStr},
     fmt,
     mem::ManuallyDrop,
+    panic::AssertUnwindSafe,
     ptr,
     time::Duration,
 };
@@ -89,7 +90,7 @@ mod ffi {
     unsafe extern "C" {
         // Both are part of libSystem, which every macOS binary links.
         pub static _dispatch_main_q: c_void;
-        pub fn dispatch_sync_f(
+        pub fn dispatch_async_f(
             queue: *const c_void,
             context: *mut c_void,
             work: unsafe extern "C" fn(*mut c_void),
@@ -579,14 +580,21 @@ impl crate::Instance for Instance {
         })?;
         drop(inner);
 
-        let view = handle.ns_view.as_ptr().cast();
-        let ns_context = NsOpenGlContext::new(&context)?;
-        ns_context.set_view(view);
+        // SAFETY: The caller guarantees that the window handle is valid.
+        let view = unsafe { Retained::retain(handle.ns_view.as_ptr().cast::<AnyObject>()) }
+            .ok_or_else(|| crate::InstanceError::new(String::from("the NSView is null")))?;
+        let ns_context = new_ns_opengl_context(&context)?;
+        let state = Arc::new(ViewState {
+            ns_context,
+            view,
+            context,
+        });
+
+        let main_state = Arc::clone(&state);
+        run_on_main(move |mtm| main_state.attach(mtm));
 
         Ok(Surface {
-            view,
-            ns_context: ManuallyDrop::new(ns_context),
-            context: ManuallyDrop::new(context),
+            state: ManuallyDrop::new(state),
             presentable: true,
             swapchain: RwLock::new(None),
         })
@@ -648,119 +656,126 @@ impl super::Device {
     }
 }
 
-/// Runs `f` on the main thread and waits for it to finish.
+/// Runs `f` on the main thread: right away if this is the main thread, otherwise later, on the
+/// main dispatch queue, without waiting for it.
 ///
-/// AppKit requires `NSOpenGLContext`'s view management to happen on the main thread. This
-/// blocks until the main thread's run loop gets to it, so calling it from another thread while
-/// the main thread waits on that thread deadlocks.
-fn run_on_main<F: FnOnce() + Send>(f: F) {
-    if MainThreadMarker::new().is_some() {
-        f();
+/// AppKit requires `NSOpenGLContext`'s view management (`setView:`, `update`, `clearDrawable`)
+/// to happen on the main thread. Waiting for the main thread instead would deadlock whenever
+/// it waits for the calling thread, e.g. while it joins a render thread that drops a surface,
+/// or after its run loop stopped. The flip side is that work queued from another thread only
+/// runs once the main thread's run loop gets to it, and never if it doesn't run anymore.
+fn run_on_main<F: FnOnce(MainThreadMarker) + Send + 'static>(f: F) {
+    if let Some(mtm) = MainThreadMarker::new() {
+        f(mtm);
         return;
     }
 
-    unsafe extern "C" fn trampoline<F: FnOnce()>(context: *mut c_void) {
-        let f = unsafe { &mut *context.cast::<Option<F>>() };
-        if let Some(f) = f.take() {
-            f();
+    unsafe extern "C" fn trampoline<F: FnOnce(MainThreadMarker)>(context: *mut c_void) {
+        // SAFETY: `context` is the box leaked below, and the queue runs every block once.
+        let f = unsafe { Box::from_raw(context.cast::<F>()) };
+        // SAFETY: The main queue only runs on the main thread.
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        // Unwinding out of this `extern "C"` function would abort the process. There's no
+        // caller left to hand a panic to, so log it and leave the main thread running.
+        if std::panic::catch_unwind(AssertUnwindSafe(move || (*f)(mtm))).is_err() {
+            log::error!("A panic occurred in work that the CGL backend ran on the main thread");
         }
     }
 
-    let mut f = Some(f);
+    let context = Box::into_raw(Box::new(f));
     unsafe {
-        ffi::dispatch_sync_f(
+        ffi::dispatch_async_f(
             ptr::addr_of!(ffi::_dispatch_main_q),
-            ptr::addr_of_mut!(f).cast(),
+            context.cast(),
             trampoline::<F>,
         )
     };
 }
 
-/// Lets a pointer to an Objective-C object cross into [`run_on_main`].
-struct MainThreadPtr(*mut AnyObject);
+/// Creates an `NSOpenGLContext` wrapping `context`, used to attach it to a view.
+fn new_ns_opengl_context(
+    context: &CglContext,
+) -> Result<Retained<AnyObject>, crate::InstanceError> {
+    let class = AnyClass::get(c"NSOpenGLContext").ok_or_else(|| {
+        crate::InstanceError::new(String::from(
+            "NSOpenGLContext is unavailable; is AppKit loaded?",
+        ))
+    })?;
 
-unsafe impl Send for MainThreadPtr {}
+    let cgl = &context.cgl;
+    let retain_count = unsafe { (cgl.get_context_retain_count)(context.raw) };
+    let raw: Option<Retained<AnyObject>> = autoreleasepool(|_| unsafe {
+        let allocated: Allocated<AnyObject> = msg_send![class, alloc];
+        msg_send![allocated, initWithCGLContextObj: context.raw]
+    });
+    let raw = raw.ok_or_else(|| {
+        crate::InstanceError::new(String::from(
+            "unable to create an NSOpenGLContext for the surface",
+        ))
+    })?;
 
-/// An `NSOpenGLContext` wrapping a surface's CGL context, used only to attach it to a view.
-struct NsOpenGlContext {
-    raw: Retained<AnyObject>,
-}
-
-impl NsOpenGlContext {
-    fn new(context: &CglContext) -> Result<Self, crate::InstanceError> {
-        let class = AnyClass::get(c"NSOpenGLContext").ok_or_else(|| {
-            crate::InstanceError::new(String::from(
-                "NSOpenGLContext is unavailable; is AppKit loaded?",
-            ))
-        })?;
-
-        let cgl = &context.cgl;
-        let retain_count = unsafe { (cgl.get_context_retain_count)(context.raw) };
-        let raw: Option<Retained<AnyObject>> = autoreleasepool(|_| unsafe {
-            let allocated: Allocated<AnyObject> = msg_send![class, alloc];
-            msg_send![allocated, initWithCGLContextObj: context.raw]
-        });
-        let raw = raw.ok_or_else(|| {
-            crate::InstanceError::new(String::from(
-                "unable to create an NSOpenGLContext for the surface",
-            ))
-        })?;
-
-        // `CglContext` keeps its own reference to the CGL context. Apple doesn't document
-        // whether `NSOpenGLContext` retains the context it wraps, so if it didn't, give it a
-        // reference of its own. Should it then never release that reference, the context
-        // leaks, which beats the over-release we'd risk otherwise.
-        let new_retain_count = unsafe { (cgl.get_context_retain_count)(context.raw) };
-        if new_retain_count <= retain_count {
-            log::debug!(
-                "NSOpenGLContext didn't retain its CGL context (retain count \
-                 {retain_count} -> {new_retain_count}), retaining it on its behalf"
-            );
-            unsafe { (cgl.retain_context)(context.raw) };
-        }
-
-        Ok(Self { raw })
+    // `CglContext` keeps its own reference to the CGL context. Apple doesn't document
+    // whether `NSOpenGLContext` retains the context it wraps, so if it didn't, give it a
+    // reference of its own. Should it then never release that reference, the context
+    // leaks, which beats the over-release we'd risk otherwise.
+    let new_retain_count = unsafe { (cgl.get_context_retain_count)(context.raw) };
+    if new_retain_count <= retain_count {
+        log::debug!(
+            "NSOpenGLContext didn't retain its CGL context (retain count \
+             {retain_count} -> {new_retain_count}), retaining it on its behalf"
+        );
+        unsafe { (cgl.retain_context)(context.raw) };
     }
 
-    fn set_view(&self, view: *mut AnyObject) {
-        let context = MainThreadPtr(Retained::as_ptr(&self.raw).cast_mut());
-        let view = MainThreadPtr(view);
-        run_on_main(move || {
-            let (context, view) = (context, view);
-            autoreleasepool(|_| unsafe {
-                let _: () = msg_send![context.0, setView: view.0];
-            });
+    Ok(raw)
+}
+
+/// The AppKit side of a [`Surface`], together with the surface's CGL context.
+///
+/// The `NSOpenGLContext` and the view are only messaged on the main thread, through
+/// [`run_on_main`]. Other threads only retain and release this, and the surface hands its
+/// own reference to the main thread when it's dropped, so the last reference, and with it
+/// the view's, is released there too.
+struct ViewState {
+    /// Declared before `context`, so that it gives up its reference to the CGL context first.
+    ns_context: Retained<AnyObject>,
+    /// The `NSView` the surface presents to. Retained, so that work queued on the main thread
+    /// can't outlive it.
+    view: Retained<AnyObject>,
+    context: CglContext,
+}
+
+// SAFETY: See the type's documentation.
+unsafe impl Send for ViewState {}
+unsafe impl Sync for ViewState {}
+
+impl ViewState {
+    fn attach(&self, _mtm: MainThreadMarker) {
+        let _cgl_lock = self.context.lock();
+        autoreleasepool(|_| unsafe {
+            let _: () = msg_send![&*self.ns_context, setView: &*self.view];
         });
     }
 
     /// Updates the drawable after the view's size or position changed.
     ///
     /// AppKit refuses to attach a context to a view that isn't on screen yet ("invalid
-    /// drawable"), so this also retries attaching `view` if the context has none.
-    fn update(&self, context: &CglContext, view: *mut AnyObject) {
-        let ns_context = MainThreadPtr(Retained::as_ptr(&self.raw).cast_mut());
-        let view = MainThreadPtr(view);
-        let cgl_context = context;
-        run_on_main(move || {
-            let (ns_context, view) = (ns_context, view);
-            let _cgl_lock = cgl_context.lock();
-            autoreleasepool(|_| unsafe {
-                let current_view: *mut AnyObject = msg_send![ns_context.0, view];
-                if current_view.is_null() {
-                    let _: () = msg_send![ns_context.0, setView: view.0];
-                }
-                let _: () = msg_send![ns_context.0, update];
-            });
+    /// drawable"), so this also retries attaching the view if the context has none.
+    fn update(&self, _mtm: MainThreadMarker) {
+        let _cgl_lock = self.context.lock();
+        autoreleasepool(|_| unsafe {
+            let current_view: *mut AnyObject = msg_send![&*self.ns_context, view];
+            if current_view.is_null() {
+                let _: () = msg_send![&*self.ns_context, setView: &*self.view];
+            }
+            let _: () = msg_send![&*self.ns_context, update];
         });
     }
 
-    fn clear_drawable(&self) {
-        let context = MainThreadPtr(Retained::as_ptr(&self.raw).cast_mut());
-        run_on_main(move || {
-            let context = context;
-            autoreleasepool(|_| unsafe {
-                let _: () = msg_send![context.0, clearDrawable];
-            });
+    fn detach(&self, _mtm: MainThreadMarker) {
+        let _cgl_lock = self.context.lock();
+        autoreleasepool(|_| unsafe {
+            let _: () = msg_send![&*self.ns_context, clearDrawable];
         });
     }
 }
@@ -777,11 +792,14 @@ pub struct Swapchain {
     format_desc: super::TextureFormatDesc,
 }
 
+/// A surface presenting to an `NSView`.
+///
+/// It can be used from any thread, but it relies on the main thread's run loop: attaching to
+/// the view, picking up size changes and detaching on drop happen on the main thread. When
+/// called from another thread, these are queued there without waiting for them, and only take
+/// effect once the main thread gets to them.
 pub struct Surface {
-    /// The `NSView` the surface presents to. Not retained, the window must outlive the surface.
-    view: *mut AnyObject,
-    ns_context: ManuallyDrop<NsOpenGlContext>,
-    context: ManuallyDrop<CglContext>,
+    state: ManuallyDrop<Arc<ViewState>>,
     pub(super) presentable: bool,
     swapchain: RwLock<Option<Swapchain>>,
 }
@@ -795,21 +813,14 @@ impl fmt::Debug for Surface {
     }
 }
 
-unsafe impl Send for Surface {}
-unsafe impl Sync for Surface {}
-
 impl Drop for Surface {
     fn drop(&mut self) {
-        self.ns_context.clear_drawable();
-        let ns_context = unsafe { ManuallyDrop::take(&mut self.ns_context) };
-        let raw = MainThreadPtr(Retained::into_raw(ns_context.raw));
-        run_on_main(move || {
-            let raw = raw;
-            // SAFETY: Balances the `Retained` that `into_raw` gave up.
-            drop(unsafe { Retained::from_raw(raw.0) });
+        // SAFETY: Field not used after this.
+        let state = unsafe { ManuallyDrop::take(&mut self.state) };
+        run_on_main(move |mtm| {
+            state.detach(mtm);
+            drop(state);
         });
-        // The `NSOpenGLContext` has released its reference to the CGL context by now.
-        unsafe { ManuallyDrop::drop(&mut self.context) };
     }
 }
 
@@ -824,9 +835,9 @@ impl Surface {
             .as_ref()
             .ok_or(crate::SurfaceError::Other("surface isn't configured"))?;
         let gl = context.lock();
-        let cgl = &self.context.cgl;
+        let cgl = &self.state.context.cgl;
 
-        let result = gl.with_surface_context(&self.context, |gl| {
+        let result = gl.with_surface_context(&self.state.context, |gl| {
             unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(sc.framebuffer)) };
             // Reattach every frame: a context only reliably observes changes another context of
             // the share group made to an object after binding it again.
@@ -862,7 +873,7 @@ impl Surface {
             };
             unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
 
-            cgl.check(unsafe { (cgl.flush_drawable)(self.context.raw) })
+            cgl.check(unsafe { (cgl.flush_drawable)(self.state.context.raw) })
         });
 
         match result {
@@ -907,16 +918,24 @@ impl crate::Surface for Surface {
                 return Err(crate::SurfaceError::Other("unsupported present mode"));
             }
         };
-        let cgl = &self.context.cgl;
-        if let Err(e) = cgl.check(unsafe {
-            (cgl.set_parameter)(self.context.raw, ffi::kCGLCPSwapInterval, &swap_interval)
-        }) {
+        let cgl = &self.state.context.cgl;
+        let cgl_lock = self.state.context.lock();
+        let result = cgl.check(unsafe {
+            (cgl.set_parameter)(
+                self.state.context.raw,
+                ffi::kCGLCPSwapInterval,
+                &swap_interval,
+            )
+        });
+        drop(cgl_lock);
+        if let Err(e) = result {
             log::error!("unable to set swap interval: {e}");
             return Err(crate::SurfaceError::Other("unable to set swap interval"));
         }
 
         // Pick up a resized view before the next present.
-        self.ns_context.update(&self.context, self.view);
+        let state = Arc::clone(&self.state);
+        run_on_main(move |mtm| state.update(mtm));
 
         let format_desc = device.shared.describe_texture_format(config.format);
         let gl = &device.shared.context.lock();
@@ -937,7 +956,7 @@ impl crate::Surface for Surface {
         unsafe { gl.bind_renderbuffer(glow::RENDERBUFFER, None) };
 
         let framebuffer = gl
-            .with_surface_context(&self.context, |gl| unsafe { gl.create_framebuffer() })
+            .with_surface_context(&self.state.context, |gl| unsafe { gl.create_framebuffer() })
             .map_err(|e| {
                 log::error!("unable to make the surface CGL context current: {e}");
                 crate::SurfaceError::Other("unable to make the surface CGL context current")
@@ -969,7 +988,7 @@ impl crate::Surface for Surface {
         let gl = &device.shared.context.lock();
         if let Some(sc) = self.swapchain.write().take() {
             unsafe { gl.delete_renderbuffer(sc.renderbuffer) };
-            if let Err(e) = gl.with_surface_context(&self.context, |gl| unsafe {
+            if let Err(e) = gl.with_surface_context(&self.state.context, |gl| unsafe {
                 gl.delete_framebuffer(sc.framebuffer)
             }) {
                 log::error!("unable to delete the swapchain framebuffer: {e}");
