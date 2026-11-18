@@ -636,6 +636,7 @@ impl crate::Instance for Instance {
             ns_context,
             view,
             context,
+            share_context: self.raw_context,
             attached: AtomicBool::new(false),
             refresh_queued: AtomicBool::new(false),
             drawable_size: Mutex::new(None),
@@ -677,6 +678,9 @@ impl super::Adapter {
     ///   wgpu-hal from this adapter.
     /// - The underlying OpenGL context must be current when dropping this adapter and when
     ///   dropping any objects returned from this adapter.
+    ///
+    /// Surfaces can't present with such an adapter: they share objects with their instance's
+    /// own context only, so it reports no capabilities for them.
     pub unsafe fn new_external(
         fun: impl FnMut(&str) -> *const c_void,
         options: wgt::GlBackendOptions,
@@ -797,6 +801,9 @@ struct ViewState {
     /// can't outlive it.
     view: Retained<AnyObject>,
     context: CglContext,
+    /// The instance's context, which `context` shares objects with. Only compared with, as
+    /// surfaces can only present textures of adapters on it.
+    share_context: ffi::CGLContextObj,
     /// Whether the context has a drawable on `view`: set by [`Self::refresh`], and cleared
     /// when presenting finds no drawable.
     attached: AtomicBool,
@@ -1143,6 +1150,15 @@ impl Surface {
         }
     }
 
+    /// Returns whether this surface can present the textures of an adapter with `context`.
+    ///
+    /// The surface context shares objects with the instance's context only, so external
+    /// adapters (see [`super::Adapter::new_external`]) and adapters of other instances can't
+    /// present to it.
+    pub(super) fn is_compatible(&self, context: &AdapterContext) -> bool {
+        context.raw == self.state.share_context
+    }
+
     pub fn supports_srgb(&self) -> bool {
         // `GL_FRAMEBUFFER_SRGB` is core in every context this backend creates. See `present`
         // for a caveat about presenting sRGB formats.
@@ -1158,6 +1174,12 @@ impl crate::Surface for Surface {
         device: &super::Device,
         config: &crate::SurfaceConfiguration,
     ) -> Result<(), crate::SurfaceError> {
+        if !self.is_compatible(&device.shared.context) {
+            return Err(crate::SurfaceError::Other(
+                "the surface belongs to another instance than the device's adapter",
+            ));
+        }
+
         // Remove the old configuration.
         unsafe { self.unconfigure(device) };
 

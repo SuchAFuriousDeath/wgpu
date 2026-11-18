@@ -1344,6 +1344,11 @@ impl crate::Adapter for super::Adapter {
             return None;
         }
 
+        #[cfg(cgl)]
+        if !surface.is_compatible(&self.shared.context) {
+            return None;
+        }
+
         if surface.presentable {
             // There is no extended-range or wide-gamut path in the GLES
             // backend; everything is presented as sRGB.
