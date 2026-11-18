@@ -332,6 +332,11 @@ impl Drop for CglContextLock<'_> {
 /// guarantee exclusive access when shared with multiple threads.
 pub struct AdapterContext {
     inner: Arc<Mutex<Inner>>,
+    /// The `CGLContextObj` owned by `inner`, or null for an external adapter.
+    ///
+    /// Kept outside the mutex so that it can be read while the context is locked, e.g. by
+    /// [`super::Adapter::expose`].
+    raw: ffi::CGLContextObj,
 }
 
 impl fmt::Debug for AdapterContext {
@@ -340,31 +345,43 @@ impl fmt::Debug for AdapterContext {
     }
 }
 
+// SAFETY: `raw` is only an identifier here; the context it points to is owned by `inner` and
+// only used through the mutex.
+unsafe impl Send for AdapterContext {}
+unsafe impl Sync for AdapterContext {}
+
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(AdapterContext: Send, Sync);
 
 impl AdapterContext {
+    /// `raw` must be the context owned by `inner`, or null if it owns none. It's passed in
+    /// rather than read from `inner`, so that this never waits for the lock.
+    fn new(inner: Arc<Mutex<Inner>>, raw: ffi::CGLContextObj) -> Self {
+        Self { inner, raw }
+    }
+
+    /// Returns whether wgpu-hal created and owns the CGL context, i.e. whether this is not an
+    /// external adapter.
+    ///
+    /// Doesn't lock the context, so it can be called while holding [`Self::lock`].
     pub fn is_owned(&self) -> bool {
-        self.inner.lock().context.is_some()
+        !self.raw.is_null()
     }
 
     /// Returns the underlying `CGLContextObj`, or null for an external adapter.
+    ///
+    /// Doesn't lock the context, so it can be called while holding [`Self::lock`].
     pub fn raw_context(&self) -> *mut c_void {
-        match self.inner.lock().context {
-            Some(ref context) => context.raw.cast(),
-            None => ptr::null_mut(),
-        }
+        self.raw.cast()
     }
 
     /// Obtain a lock to the CGL context and get handle to the [`glow::Context`] that can be
     /// used to do rendering.
     #[track_caller]
     pub fn lock(&self) -> AdapterContextLock<'_> {
-        let inner = self
-            .inner
-            // Don't lock forever. If it takes longer than 1 second to get the lock we've got a
-            // deadlock and should panic to show where we got stuck
-            .try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
+        // Don't lock forever. If it takes longer than 1 second to get the lock we've got a
+        // deadlock and should panic to show where we got stuck
+        let inner = try_lock_inner(&self.inner)
             .expect("Could not lock adapter context. This is most-likely a deadlock.");
 
         if let Some(context) = &inner.context {
@@ -384,6 +401,10 @@ impl fmt::Debug for AdapterContextLock<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AdapterContextLock").finish_non_exhaustive()
     }
+}
+
+fn try_lock_inner(inner: &Mutex<Inner>) -> Option<MutexGuard<'_, Inner>> {
+    inner.try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
 }
 
 impl AdapterContextLock<'_> {
@@ -464,7 +485,13 @@ pub struct Instance {
     pixel_format: Arc<PixelFormat>,
     options: wgt::GlBackendOptions,
     inner: Arc<Mutex<Inner>>,
+    /// The context owned by `inner`.
+    raw_context: ffi::CGLContextObj,
 }
+
+// SAFETY: See `AdapterContext`.
+unsafe impl Send for Instance {}
+unsafe impl Sync for Instance {}
 
 impl fmt::Debug for Instance {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -515,6 +542,7 @@ impl crate::Instance for Instance {
         Ok(Instance {
             pixel_format,
             options: desc.backend_options.gl.clone(),
+            raw_context: context.raw,
             inner: Arc::new(Mutex::new(Inner {
                 gl,
                 context: Some(context),
@@ -538,7 +566,13 @@ impl crate::Instance for Instance {
             )));
         };
 
-        let inner = self.inner.lock();
+        // The share context is only safe to use while no other thread renders with it. Don't
+        // block forever if the calling thread already holds the adapter context lock.
+        let inner = try_lock_inner(&self.inner).ok_or_else(|| {
+            crate::InstanceError::new(String::from(
+                "timed out waiting for the adapter context lock",
+            ))
+        })?;
         let share = inner.context.as_ref();
         let context = CglContext::new(&self.pixel_format, share).map_err(|e| {
             crate::InstanceError::new(format!("unable to create surface CGL context: {e}"))
@@ -564,9 +598,7 @@ impl crate::Instance for Instance {
     ) -> Vec<crate::ExposedAdapter<super::Api>> {
         unsafe {
             super::Adapter::expose(
-                AdapterContext {
-                    inner: self.inner.clone(),
-                },
+                AdapterContext::new(Arc::clone(&self.inner), self.raw_context),
                 self.options.clone(),
             )
         }
@@ -592,12 +624,13 @@ impl super::Adapter {
         let context = unsafe { glow::Context::from_loader_function(fun) };
         unsafe {
             Self::expose(
-                AdapterContext {
-                    inner: Arc::new(Mutex::new(Inner {
+                AdapterContext::new(
+                    Arc::new(Mutex::new(Inner {
                         gl: ManuallyDrop::new(context),
                         context: None,
                     })),
-                },
+                    ptr::null_mut(),
+                ),
                 options,
             )
         }
